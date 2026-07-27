@@ -3,10 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestTokenStoreSetGet(t *testing.T) {
@@ -63,5 +68,101 @@ func TestFetchTokenUnauthorized(t *testing.T) {
 
 	if _, err := fetchToken(context.Background(), srv.Client(), srv.URL, "wrong"); err == nil {
 		t.Fatal("expected error on 401")
+	}
+}
+
+type capturedPublish struct {
+	status StatusMessage
+	token  string
+}
+
+type fakeStatusPublisher struct {
+	mu   sync.Mutex
+	msgs []capturedPublish
+}
+
+func (f *fakeStatusPublisher) PublishStatus(_ context.Context, s StatusMessage, token string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.msgs = append(f.msgs, capturedPublish{s, token})
+	return nil
+}
+
+func newTestWorker(prob float32, seed int64) (*Worker, *fakeStatusPublisher) {
+	ts := &TokenStore{}
+	ts.Set("worker-token")
+	fp := &fakeStatusPublisher{}
+	w := &Worker{
+		id:          "worker-0",
+		tokens:      ts,
+		pub:         fp,
+		sleep:       func() time.Duration { return 0 },
+		successProb: prob,
+		rnd:         rand.New(rand.NewSource(seed)),
+		log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	return w, fp
+}
+
+func TestWorkerExecuteSuccess(t *testing.T) {
+	w, fp := newTestWorker(1.0, 1) // prob 1.0 => always COMPLETED
+	w.execute(context.Background(), Mission{ID: "m1"})
+
+	if len(fp.msgs) != 2 {
+		t.Fatalf("published %d messages, want 2", len(fp.msgs))
+	}
+	if fp.msgs[0].status.Status != "IN_PROGRESS" {
+		t.Fatalf("first = %q, want IN_PROGRESS", fp.msgs[0].status.Status)
+	}
+	if fp.msgs[1].status.Status != "COMPLETED" {
+		t.Fatalf("second = %q, want COMPLETED", fp.msgs[1].status.Status)
+	}
+	if fp.msgs[0].token != "worker-token" {
+		t.Fatalf("token = %q, want worker-token", fp.msgs[0].token)
+	}
+}
+
+func TestWorkerExecuteFailure(t *testing.T) {
+	w, fp := newTestWorker(0.0, 1) // prob 0.0 => always FAILED
+	w.execute(context.Background(), Mission{ID: "m1"})
+	if fp.msgs[1].status.Status != "FAILED" {
+		t.Fatalf("terminal = %q, want FAILED", fp.msgs[1].status.Status)
+	}
+}
+
+func TestRunWorkerPoolExecutesAndAcks(t *testing.T) {
+	missions := make(chan ackableMission, 3)
+	var acked int32
+	for i := 0; i < 3; i++ {
+		id := i
+		missions <- ackableMission{
+			mission: Mission{ID: "m" + string(rune('0'+id))},
+			ack:     func() { atomic.AddInt32(&acked, 1) },
+		}
+	}
+	close(missions)
+
+	fp := &fakeStatusPublisher{}
+	newWorker := func(id string) *Worker {
+		ts := &TokenStore{}
+		ts.Set("t")
+		return &Worker{
+			id: id, tokens: ts, pub: fp,
+			sleep:       func() time.Duration { return 0 },
+			successProb: 1.0, rnd: rand.New(rand.NewSource(1)),
+			log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}
+	}
+	var wg sync.WaitGroup
+	runWorkerPool(context.Background(), 2, missions, newWorker, &wg)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&acked); got != 3 {
+		t.Fatalf("acked = %d, want 3", got)
+	}
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	if len(fp.msgs) != 6 { // 3 missions * 2 status each
+		t.Fatalf("status msgs = %d, want 6", len(fp.msgs))
 	}
 }
