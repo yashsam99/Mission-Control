@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 func TestMissionStoreCreateAndGet(t *testing.T) {
@@ -301,5 +303,35 @@ func TestHealth(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("health status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestHandleStatusValidToken(t *testing.T) {
+	c, _ := newTestCommander()
+	c.store.Create(Mission{ID: "m1", Status: "QUEUED"})
+	tok, _ := signToken(c.jwtSecret, 30*time.Second)
+	body, _ := json.Marshal(StatusMessage{MissionID: "m1", Status: "COMPLETED"})
+
+	if err := c.handleStatus(amqp.Table{"authorization": tok}, body); err != nil {
+		t.Fatalf("handleStatus valid: %v", err)
+	}
+	m, _ := c.store.Get("m1")
+	if m.Status != "COMPLETED" {
+		t.Fatalf("status = %q, want COMPLETED", m.Status)
+	}
+}
+
+func TestHandleStatusExpiredTokenIsBreach(t *testing.T) {
+	c, _ := newTestCommander()
+	c.store.Create(Mission{ID: "m1", Status: "QUEUED"})
+	tok, _ := signToken(c.jwtSecret, -1*time.Second)
+	body, _ := json.Marshal(StatusMessage{MissionID: "m1", Status: "COMPLETED"})
+
+	if err := c.handleStatus(amqp.Table{"authorization": tok}, body); err == nil {
+		t.Fatal("expected breach error for expired token")
+	}
+	m, _ := c.store.Get("m1")
+	if m.Status != "QUEUED" {
+		t.Fatalf("status = %q, want unchanged QUEUED", m.Status)
 	}
 }
