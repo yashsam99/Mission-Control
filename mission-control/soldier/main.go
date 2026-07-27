@@ -92,6 +92,14 @@ type Worker struct {
 	log         *slog.Logger
 }
 
+// publish sends a status update for missionID. It deliberately uses a
+// fresh, bounded-timeout context for the actual AMQP publish rather than
+// the ctx passed in by execute: execute's ctx may already be cancelled
+// (graceful shutdown lets an in-flight mission finish before its order is
+// ACKed), and amqp091-go's PublishWithContext short-circuits on an
+// already-cancelled context without publishing anything. Using ctx here
+// would silently drop the terminal COMPLETED/FAILED status while the
+// order still gets ACKed, leaving the mission stuck IN_PROGRESS forever.
 func (w *Worker) publish(ctx context.Context, missionID, status string) {
 	msg := StatusMessage{
 		MissionID: missionID,
@@ -99,7 +107,9 @@ func (w *Worker) publish(ctx context.Context, missionID, status string) {
 		WorkerID:  w.id,
 		Timestamp: time.Now().UTC(),
 	}
-	if err := w.pub.PublishStatus(ctx, msg, w.tokens.Get()); err != nil {
+	pubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := w.pub.PublishStatus(pubCtx, msg, w.tokens.Get()); err != nil {
 		w.log.Error("failed to publish status", "mission_id", missionID, "status", status, "err", err)
 	}
 }

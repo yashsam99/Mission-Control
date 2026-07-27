@@ -74,6 +74,7 @@ func TestFetchTokenUnauthorized(t *testing.T) {
 type capturedPublish struct {
 	status StatusMessage
 	token  string
+	ctxErr error // result of ctx.Err() at call time, captured for cancellation assertions
 }
 
 type fakeStatusPublisher struct {
@@ -81,10 +82,10 @@ type fakeStatusPublisher struct {
 	msgs []capturedPublish
 }
 
-func (f *fakeStatusPublisher) PublishStatus(_ context.Context, s StatusMessage, token string) error {
+func (f *fakeStatusPublisher) PublishStatus(ctx context.Context, s StatusMessage, token string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.msgs = append(f.msgs, capturedPublish{s, token})
+	f.msgs = append(f.msgs, capturedPublish{status: s, token: token, ctxErr: ctx.Err()})
 	return nil
 }
 
@@ -127,6 +128,38 @@ func TestWorkerExecuteFailure(t *testing.T) {
 	w.execute(context.Background(), Mission{ID: "m1"})
 	if fp.msgs[1].status.Status != "FAILED" {
 		t.Fatalf("terminal = %q, want FAILED", fp.msgs[1].status.Status)
+	}
+}
+
+// TestWorkerExecutePublishesTerminalStatusAfterCtxCancelled proves the fix
+// for the graceful-shutdown bug: execute intentionally keeps running after
+// ctx is cancelled (so an in-flight mission finishes before its order is
+// ACKed), and the terminal COMPLETED/FAILED status must still reach
+// PublishStatus with a live (non-cancelled) context — not the cancelled
+// ctx, which amqp091-go's real PublishWithContext would short-circuit on
+// without publishing anything. Before the fix, publish forwarded the
+// caller's (cancelled) ctx straight through to PublishStatus.
+func TestWorkerExecutePublishesTerminalStatusAfterCtxCancelled(t *testing.T) {
+	w, fp := newTestWorker(1.0, 1) // prob 1.0 => always COMPLETED
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // simulate SIGTERM having already fired before execute runs
+
+	w.execute(ctx, Mission{ID: "m1"})
+
+	if len(fp.msgs) != 2 {
+		t.Fatalf("published %d messages, want 2 (cancelled ctx must not drop the terminal publish)", len(fp.msgs))
+	}
+	if fp.msgs[0].status.Status != "IN_PROGRESS" {
+		t.Fatalf("first = %q, want IN_PROGRESS", fp.msgs[0].status.Status)
+	}
+	if fp.msgs[1].status.Status != "COMPLETED" {
+		t.Fatalf("terminal status = %q, want COMPLETED", fp.msgs[1].status.Status)
+	}
+	for i, m := range fp.msgs {
+		if m.ctxErr != nil {
+			t.Fatalf("msg[%d]: PublishStatus received a cancelled context (err=%v); publish must use a fresh context, not execute's cancelled ctx", i, m.ctxErr)
+		}
 	}
 }
 

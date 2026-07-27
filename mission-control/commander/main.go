@@ -344,7 +344,12 @@ func (b *Broker) ConsumeStatus(ctx context.Context, handle func(amqp.Table, []by
 				return
 			case d, ok := <-deliveries:
 				if !ok {
-					return // channel closed; supervise() will reconnect, main re-invokes Consume
+					// Channel closed (e.g. connection lost). supervise() will
+					// reconnect the underlying AMQP connection, but nothing
+					// re-invokes ConsumeStatus afterwards, so this goroutine
+					// exits and status consumption stops permanently until
+					// the process restarts. See README "Known Limitations".
+					return
 				}
 				if herr := handle(d.Headers, d.Body); herr != nil {
 					d.Nack(false, false)
