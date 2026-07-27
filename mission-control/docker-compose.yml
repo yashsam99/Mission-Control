@@ -1,0 +1,49 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: mission
+      RABBITMQ_DEFAULT_PASS: control
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  commander:
+    build:
+      context: .
+      dockerfile: commander/Dockerfile
+    environment:
+      BOOTSTRAP_SECRET: super-secret-bootstrap
+      JWT_SECRET: super-secret-jwt-key
+      RABBITMQ_URL: amqp://mission:control@rabbitmq:5672/
+      HTTP_PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/commander", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  soldier:
+    build:
+      context: .
+      dockerfile: soldier/Dockerfile
+    environment:
+      BOOTSTRAP_SECRET: super-secret-bootstrap
+      COMMANDER_URL: http://commander:8080
+      RABBITMQ_URL: amqp://mission:control@rabbitmq:5672/
+      WORKER_POOL_SIZE: "10"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      commander:
+        condition: service_healthy
