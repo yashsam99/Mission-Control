@@ -9,8 +9,12 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -154,6 +158,12 @@ type Broker struct {
 	mu   sync.RWMutex
 	conn *amqp.Connection
 	ch   *amqp.Channel
+
+	// ordersDone is closed when ConsumeOrders's internal delivery-forwarding
+	// goroutine actually returns (via ctx cancellation or the deliveries
+	// channel closing). Callers use OrdersDone() to know it is safe to close
+	// the missions channel without risking a send-on-closed-channel panic.
+	ordersDone chan struct{}
 }
 
 func NewBroker(url string, log *slog.Logger) *Broker {
@@ -267,7 +277,9 @@ func (b *Broker) ConsumeOrders(ctx context.Context, prefetch int, missions chan<
 	if err != nil {
 		return err
 	}
+	b.ordersDone = make(chan struct{})
 	go func() {
+		defer close(b.ordersDone)
 		for {
 			select {
 			case <-ctx.Done():
@@ -283,11 +295,107 @@ func (b *Broker) ConsumeOrders(ctx context.Context, prefetch int, missions chan<
 					continue
 				}
 				delivery := d
-				missions <- ackableMission{mission: m, ack: func() { delivery.Ack(false) }}
+				// Use a select (rather than a plain blocking send) so that a
+				// ctx cancellation racing with a full/unread missions channel
+				// can't leave this goroutine stuck trying to send after the
+				// caller closes missions on shutdown.
+				select {
+				case missions <- ackableMission{mission: m, ack: func() { delivery.Ack(false) }}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}()
 	return nil
 }
 
-func main() {} // replaced in Task 9
+// OrdersDone returns a channel that is closed once ConsumeOrders's internal
+// delivery-forwarding goroutine has actually returned. Callers must wait on
+// this before closing the missions channel passed to ConsumeOrders, to avoid
+// a send-on-closed-channel panic if that goroutine is mid-send.
+func (b *Broker) OrdersDone() <-chan struct{} { return b.ordersDone }
+
+const rotationInterval = 25 * time.Second
+
+func getenv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func main() {
+	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	commanderURL := getenv("COMMANDER_URL", "http://localhost:8080")
+	bootstrap := getenv("BOOTSTRAP_SECRET", "bootstrap")
+	poolSize, err := strconv.Atoi(getenv("WORKER_POOL_SIZE", "10"))
+	if err != nil || poolSize < 1 {
+		poolSize = 10
+	}
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+
+	// Bootstrap: acquire the first token before doing anything else.
+	tokens := &TokenStore{}
+	firstTok, err := fetchToken(ctx, httpClient, commanderURL, bootstrap)
+	if err != nil {
+		log.Error("initial token acquisition failed", "err", err)
+		os.Exit(1)
+	}
+	tokens.Set(firstTok)
+	log.Info("bootstrap token acquired")
+
+	// Rotation goroutine.
+	go func() {
+		ticker := time.NewTicker(rotationInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				tok, err := fetchToken(ctx, httpClient, commanderURL, bootstrap)
+				if err != nil {
+					log.Warn("token rotation failed, keeping previous token", "err", err)
+					continue
+				}
+				tokens.Set(tok)
+				log.Info("Token Rotated")
+			}
+		}
+	}()
+
+	broker := NewBroker(getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"), log)
+	if err := broker.Connect(ctx); err != nil {
+		log.Error("broker connect failed", "err", err)
+		os.Exit(1)
+	}
+
+	missions := make(chan ackableMission, poolSize)
+	newWorker := func(id string) *Worker {
+		return &Worker{
+			id: id, tokens: tokens, pub: broker,
+			sleep: missionSleep, successProb: 0.90,
+			rnd: rand.New(rand.NewSource(time.Now().UnixNano())),
+			log: log,
+		}
+	}
+	var wg sync.WaitGroup
+	runWorkerPool(ctx, poolSize, missions, newWorker, &wg)
+
+	if err := broker.ConsumeOrders(ctx, poolSize, missions); err != nil {
+		log.Error("order consumer failed", "err", err)
+		os.Exit(1)
+	}
+	log.Info("soldier ready", "workers", poolSize)
+
+	<-ctx.Done()
+	log.Info("shutting down soldier: draining in-flight missions")
+	<-broker.OrdersDone() // wait for the consumer goroutine to actually stop before closing
+	close(missions)
+	wg.Wait()
+	log.Info("drain complete")
+}
