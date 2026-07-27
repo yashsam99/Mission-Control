@@ -144,3 +144,56 @@ func TestMissionStoreCreatedAtTimestamp(t *testing.T) {
 		t.Errorf("UpdatedAt is in the future: %v", retrieved.UpdatedAt)
 	}
 }
+
+func TestSignAndValidateToken(t *testing.T) {
+	secret := []byte("test-secret-key")
+	ttl := 1 * time.Hour
+
+	token, err := signToken(secret, ttl)
+	if err != nil {
+		t.Fatalf("signToken failed: %v", err)
+	}
+
+	if token == "" {
+		t.Fatal("expected non-empty token")
+	}
+
+	// Validate the token with the same secret
+	err = validateToken(secret, token)
+	if err != nil {
+		t.Fatalf("validateToken failed: %v", err)
+	}
+}
+
+func TestValidateTokenExpired(t *testing.T) {
+	secret := []byte("test-secret-key")
+	ttl := -1 * time.Second // already expired
+
+	token, err := signToken(secret, ttl)
+	if err != nil {
+		t.Fatalf("signToken failed: %v", err)
+	}
+
+	// Validate should fail because token is expired
+	err = validateToken(secret, token)
+	if err == nil {
+		t.Fatal("expected validateToken to fail for expired token, but got nil")
+	}
+}
+
+func TestValidateTokenBadSignature(t *testing.T) {
+	secret := []byte("test-secret-key")
+	ttl := 1 * time.Hour
+
+	token, err := signToken(secret, ttl)
+	if err != nil {
+		t.Fatalf("signToken failed: %v", err)
+	}
+
+	// Validate with wrong secret
+	wrongSecret := []byte("wrong-secret")
+	err = validateToken(wrongSecret, token)
+	if err == nil {
+		t.Fatal("expected validateToken to fail with wrong secret, but got nil")
+	}
+}
