@@ -1,6 +1,13 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -195,5 +202,104 @@ func TestValidateTokenBadSignature(t *testing.T) {
 	err = validateToken(wrongSecret, token)
 	if err == nil {
 		t.Fatal("expected validateToken to fail with wrong secret, but got nil")
+	}
+}
+
+type fakePublisher struct{ published []Mission }
+
+func (f *fakePublisher) PublishOrder(_ context.Context, m Mission) error {
+	f.published = append(f.published, m)
+	return nil
+}
+
+func newTestCommander() (*Commander, *fakePublisher) {
+	fp := &fakePublisher{}
+	c := &Commander{
+		store:           NewMissionStore(),
+		publisher:       fp,
+		bootstrapSecret: "boot",
+		jwtSecret:       []byte("jwt"),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	return c, fp
+}
+
+func TestPostMissionQueuesAndPublishes(t *testing.T) {
+	c, fp := newTestCommander()
+	srv := httptest.NewServer(c.routes())
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/missions", "application/json",
+		strings.NewReader(`{"objective":"recon"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+	var body struct {
+		MissionID string `json:"mission_id"`
+	}
+	json.NewDecoder(resp.Body).Decode(&body)
+	if body.MissionID == "" {
+		t.Fatal("expected a mission_id in response")
+	}
+	if len(fp.published) != 1 {
+		t.Fatalf("published %d orders, want 1", len(fp.published))
+	}
+	m, ok := c.store.Get(body.MissionID)
+	if !ok || m.Status != "QUEUED" {
+		t.Fatalf("stored mission = %+v, ok=%v; want QUEUED", m, ok)
+	}
+}
+
+func TestGetMissionNotFound(t *testing.T) {
+	c, _ := newTestCommander()
+	srv := httptest.NewServer(c.routes())
+	defer srv.Close()
+
+	resp, _ := http.Get(srv.URL + "/missions/nope")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestAuthValidAndInvalidSecret(t *testing.T) {
+	c, _ := newTestCommander()
+	srv := httptest.NewServer(c.routes())
+	defer srv.Close()
+
+	ok, _ := http.Post(srv.URL+"/auth", "application/json",
+		strings.NewReader(`{"bootstrap_secret":"boot"}`))
+	defer ok.Body.Close()
+	if ok.StatusCode != http.StatusOK {
+		t.Fatalf("valid secret status = %d, want 200", ok.StatusCode)
+	}
+	var ar struct {
+		Token string `json:"token"`
+	}
+	json.NewDecoder(ok.Body).Decode(&ar)
+	if err := validateToken(c.jwtSecret, ar.Token); err != nil {
+		t.Fatalf("issued token invalid: %v", err)
+	}
+
+	bad, _ := http.Post(srv.URL+"/auth", "application/json",
+		strings.NewReader(`{"bootstrap_secret":"wrong"}`))
+	defer bad.Body.Close()
+	if bad.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("bad secret status = %d, want 401", bad.StatusCode)
+	}
+}
+
+func TestHealth(t *testing.T) {
+	c, _ := newTestCommander()
+	srv := httptest.NewServer(c.routes())
+	defer srv.Close()
+	resp, _ := http.Get(srv.URL + "/health")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("health status = %d, want 200", resp.StatusCode)
 	}
 }
