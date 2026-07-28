@@ -245,9 +245,9 @@ rotation: PASS
 
 ### `commander`
 
-| Variable            | Default                                | Purpose                                                            |
-|-------------------  |--------------------------------------  |-----------------------------------------------------------------   |
-| `HTTP_PORT`         | `8080`                                | Port the REST API listens on.                                       |
+| Variable            | Default                              | Purpose                                                              |
+|-------------------  |-------------------------------------------------------------------------------------------------------      |
+| `HTTP_PORT`         | `8080`                               | Port the REST API listens on.                                        |
 | `RABBITMQ_URL`      | `amqp://guest:guest@localhost:5672/` | AMQP connection string (includes broker credentials).                |
 | `BOOTSTRAP_SECRET`  | `bootstrap`                          | Shared secret `POST /auth` requires to mint a JWT.                   |
 | `JWT_SECRET`        | `jwt-secret`                         | HS256 signing key for status-message JWTs. Held only by `commander`. |
@@ -269,41 +269,7 @@ apply when running a binary standalone.
 These were found and confirmed during implementation review — noted here so
 operators know what to expect, not as hypothetical risks:
 
-1. **A mid-run AMQP reconnect silently stops order consumption on that
-   soldier.** `soldier`'s `Broker.Connect` supervises the connection and
-   will transparently redial after a disconnect, but `ConsumeOrders` is
-   only ever invoked once, from `main()`, right after the initial connect.
-   If the connection drops and is re-established *after* startup, the old
-   `ch.Consume` delivery channel is gone and nothing re-subscribes to
-   `orders_queue` on the new channel. The process keeps running — no crash,
-   no error logged beyond the reconnect message — it just silently stops
-   picking up new missions for the rest of that process's lifetime.
-   Existing in-flight missions still finish and their status still
-   publishes fine (status publishing re-resolves `b.channel()` on every
-   call). **Workaround:** if you suspect this happened (e.g. a soldier's
-   logs show a `broker connection lost, reconnecting` message and no new
-   missions are landing on it afterward), restart that soldier
-   container/replica — `docker compose restart soldier` or scale it down
-   and back up.
-
-2. **A mid-run AMQP reconnect silently stops status recording on
-   `commander`.** This is the mirror image of limitation 1, on the
-   consuming side: `commander`'s `Broker.supervise` transparently redials
-   after a disconnect, but `ConsumeStatus` is only ever invoked once, from
-   `main()`, right after the initial connect. If the connection drops and
-   is re-established *after* startup, the old `ch.Consume` delivery
-   channel for `status_queue` is gone and nothing re-subscribes on the new
-   channel. The process keeps running — no crash, no error logged beyond
-   the reconnect message — it just silently stops recording *any* mission
-   status updates (`IN_PROGRESS`, `COMPLETED`, `FAILED`) for the rest of
-   that process's lifetime, even though soldiers keep publishing them
-   successfully. Missions will appear stuck at whatever status they last
-   had before the reconnect. **Workaround:** if you suspect this happened
-   (e.g. commander's logs show a `broker connection lost, reconnecting`
-   message and mission statuses stop updating afterward), restart the
-   commander process/container — `docker compose restart commander`.
-
-3. **Dev secrets are plaintext in `docker-compose.yml`.**
+1. **Dev secrets are plaintext in `docker-compose.yml`.**
    `BOOTSTRAP_SECRET`, `JWT_SECRET`, and the credentials embedded in
    `RABBITMQ_URL` (`mission`/`control`) are committed directly in the
    compose file. That's fine for local development and this demo, but

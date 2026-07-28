@@ -147,7 +147,7 @@ type ackableMission struct {
 // channel, executes the mission, then ACKs its order. wg tracks active
 // missions so the caller can wait for a clean drain on shutdown.
 func runWorkerPool(ctx context.Context, size int, missions <-chan ackableMission, newWorker func(id string) *Worker, wg *sync.WaitGroup) {
-	for i := 0; i < size; i++ {
+	for i := range size {
 		w := newWorker(fmt.Sprintf("worker-%d", i))
 		wg.Add(1)
 		go func() {
@@ -274,7 +274,10 @@ func (b *Broker) PublishStatus(ctx context.Context, s StatusMessage, token strin
 
 // ConsumeOrders sets QoS to `prefetch` (= pool size) so the Soldier never holds
 // more unacked orders than it has workers, then forwards deliveries onto the
-// missions channel with an ack closure bound to each delivery.
+// missions channel with an ack closure bound to each delivery. If the
+// connection drops and Connect's supervisor goroutine redials, the returned
+// consumer resubscribes to orders_queue on the new channel instead of
+// silently going idle — see runOrdersConsumer.
 func (b *Broker) ConsumeOrders(ctx context.Context, prefetch int, missions chan<- ackableMission) error {
 	ch, err := b.channel()
 	if err != nil {
@@ -288,42 +291,93 @@ func (b *Broker) ConsumeOrders(ctx context.Context, prefetch int, missions chan<
 		return err
 	}
 	b.ordersDone = make(chan struct{})
-	go func() {
-		defer close(b.ordersDone)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case d, ok := <-deliveries:
-				if !ok {
-					return
-				}
-				var m Mission
-				if err := json.Unmarshal(d.Body, &m); err != nil {
-					b.log.Error("bad order payload, dropping", "err", err)
-					d.Nack(false, false)
-					continue
-				}
-				delivery := d
-				// Use a select (rather than a plain blocking send) so that a
-				// ctx cancellation racing with a full/unread missions channel
-				// can't leave this goroutine stuck trying to send after the
-				// caller closes missions on shutdown.
-				select {
-				case missions <- ackableMission{mission: m, ack: func() { delivery.Ack(false) }}:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}
-	}()
+	go b.runOrdersConsumer(ctx, prefetch, missions, deliveries)
 	return nil
 }
 
-// OrdersDone returns a channel that is closed once ConsumeOrders's internal
-// delivery-forwarding goroutine has actually returned. Callers must wait on
-// this before closing the missions channel passed to ConsumeOrders, to avoid
-// a send-on-closed-channel panic if that goroutine is mid-send.
+// runOrdersConsumer forwards deliveries until ctx is cancelled. If deliveries
+// closes because the underlying connection dropped (rather than ctx being
+// done), it polls until a freshly-reconnected channel is available and
+// re-subscribes to orders_queue, instead of returning and leaving the
+// soldier permanently idle.
+func (b *Broker) runOrdersConsumer(ctx context.Context, prefetch int, missions chan<- ackableMission, deliveries <-chan amqp.Delivery) {
+	defer close(b.ordersDone)
+	for {
+		if b.forwardOrderDeliveries(ctx, deliveries, missions) {
+			return
+		}
+		b.log.Warn("orders consumer channel closed, resubscribing to orders_queue")
+		next, ok := b.resubscribeOrders(ctx, prefetch)
+		if !ok {
+			return
+		}
+		deliveries = next
+	}
+}
+
+// forwardOrderDeliveries drains deliveries onto missions until either ctx is
+// cancelled (returns true) or the deliveries channel closes, e.g. because the
+// connection was lost (returns false, so the caller can resubscribe).
+func (b *Broker) forwardOrderDeliveries(ctx context.Context, deliveries <-chan amqp.Delivery, missions chan<- ackableMission) (ctxDone bool) {
+	for {
+		select {
+		case <-ctx.Done():
+			return true
+		case d, ok := <-deliveries:
+			if !ok {
+				return false
+			}
+			var m Mission
+			if err := json.Unmarshal(d.Body, &m); err != nil {
+				b.log.Error("bad order payload, dropping", "err", err)
+				d.Nack(false, false)
+				continue
+			}
+			delivery := d
+			// Use a select (rather than a plain blocking send) so that a
+			// ctx cancellation racing with a full/unread missions channel
+			// can't leave this goroutine stuck trying to send after the
+			// caller closes missions on shutdown.
+			select {
+			case missions <- ackableMission{mission: m, ack: func() { delivery.Ack(false) }}:
+			case <-ctx.Done():
+				return true
+			}
+		}
+	}
+}
+
+// resubscribeOrders polls until it can obtain a live channel (i.e. until
+// Connect's supervisor goroutine has redialed) and re-establish QoS plus a
+// fresh orders_queue consumer on it, or until ctx is cancelled.
+func (b *Broker) resubscribeOrders(ctx context.Context, prefetch int) (<-chan amqp.Delivery, bool) {
+	const retryInterval = time.Second
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-time.After(retryInterval):
+		}
+		ch, err := b.channel()
+		if err != nil {
+			continue
+		}
+		if err := ch.Qos(prefetch, 0, false); err != nil {
+			continue
+		}
+		deliveries, err := ch.Consume(ordersQueue, "", false, false, false, false, nil)
+		if err != nil {
+			continue
+		}
+		return deliveries, true
+	}
+}
+
+// OrdersDone returns a channel that is closed once runOrdersConsumer has
+// actually returned (i.e. ctx was cancelled — a lost connection alone just
+// triggers a resubscribe, not a return). Callers must wait on this before
+// closing the missions channel passed to ConsumeOrders, to avoid a
+// send-on-closed-channel panic if that goroutine is mid-send.
 func (b *Broker) OrdersDone() <-chan struct{} { return b.ordersDone }
 
 const rotationInterval = 25 * time.Second

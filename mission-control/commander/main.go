@@ -328,6 +328,9 @@ func (b *Broker) PublishStatus(ctx context.Context, s StatusMessage, token strin
 
 // ConsumeStatus streams status_queue deliveries into handle. A nil error ACKs;
 // a non-nil error nacks without requeue (poison/breach messages are dropped).
+// If the connection drops and supervise() redials, the consumer resubscribes
+// to status_queue on the new channel instead of going silent — see
+// runStatusConsumer.
 func (b *Broker) ConsumeStatus(ctx context.Context, handle func(amqp.Table, []byte) error) error {
 	ch, err := b.channel()
 	if err != nil {
@@ -337,29 +340,71 @@ func (b *Broker) ConsumeStatus(ctx context.Context, handle func(amqp.Table, []by
 	if err != nil {
 		return err
 	}
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case d, ok := <-deliveries:
-				if !ok {
-					// Channel closed (e.g. connection lost). supervise() will
-					// reconnect the underlying AMQP connection, but nothing
-					// re-invokes ConsumeStatus afterwards, so this goroutine
-					// exits and status consumption stops permanently until
-					// the process restarts. See README "Known Limitations".
-					return
-				}
-				if herr := handle(d.Headers, d.Body); herr != nil {
-					d.Nack(false, false)
-				} else {
-					d.Ack(false)
-				}
+	go b.runStatusConsumer(ctx, handle, deliveries)
+	return nil
+}
+
+// runStatusConsumer forwards deliveries until ctx is cancelled. If deliveries
+// closes because the connection dropped (rather than ctx being done), it
+// polls until a freshly-reconnected channel is available and re-subscribes
+// to status_queue, instead of returning and leaving status updates unrecorded
+// for the rest of the process's life.
+func (b *Broker) runStatusConsumer(ctx context.Context, handle func(amqp.Table, []byte) error, deliveries <-chan amqp.Delivery) {
+	for {
+		if b.forwardStatusDeliveries(ctx, deliveries, handle) {
+			return
+		}
+		b.log.Warn("status consumer channel closed, resubscribing to status_queue")
+		next, ok := b.resubscribeStatus(ctx)
+		if !ok {
+			return
+		}
+		deliveries = next
+	}
+}
+
+// forwardStatusDeliveries drains deliveries into handle until either ctx is
+// cancelled (returns true) or the deliveries channel closes, e.g. because the
+// connection was lost (returns false, so the caller can resubscribe).
+func (b *Broker) forwardStatusDeliveries(ctx context.Context, deliveries <-chan amqp.Delivery, handle func(amqp.Table, []byte) error) (ctxDone bool) {
+	for {
+		select {
+		case <-ctx.Done():
+			return true
+		case d, ok := <-deliveries:
+			if !ok {
+				return false
+			}
+			if herr := handle(d.Headers, d.Body); herr != nil {
+				d.Nack(false, false)
+			} else {
+				d.Ack(false)
 			}
 		}
-	}()
-	return nil
+	}
+}
+
+// resubscribeStatus polls until it can obtain a live channel (i.e. until
+// supervise() has redialed) and re-subscribe to status_queue on it, or until
+// ctx is cancelled.
+func (b *Broker) resubscribeStatus(ctx context.Context) (<-chan amqp.Delivery, bool) {
+	const retryInterval = time.Second
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-time.After(retryInterval):
+		}
+		ch, err := b.channel()
+		if err != nil {
+			continue
+		}
+		deliveries, err := ch.Consume(statusQueue, "", false, false, false, false, nil)
+		if err != nil {
+			continue
+		}
+		return deliveries, true
+	}
 }
 
 func (c *Commander) handleStatus(headers amqp.Table, body []byte) error {
