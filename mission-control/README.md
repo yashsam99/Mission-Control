@@ -278,3 +278,33 @@ operators know what to expect, not as hypothetical risks:
    / variable substitution, or a proper secrets manager (Docker secrets,
    Vault, cloud KMS, etc.) — with `RABBITMQ_URL`'s embedded username/
    password rotated at the same time.
+
+## AI Usage
+
+In accordance with project guidelines, AI tooling was utilized transparently to accelerate system design and documentation formatting.
+
+### 1
+
+**Tool Used:** Gemini
+
+Application: Used as a Principal Architectural sounding board to compare message broker trade-offs (RabbitMQ vs. NATS), validate the thread-safe atomic.Value strategy for JWT rotation in Go, and generate the Mermaid.js architecture diagrams.
+
+**Prompts Used:**
+
+"Act as Principal Technical Architect with proficiency in golang, event-driven architectures, system design and distributed systems. Your task is to understand the requirements and functionality of the Project and come up with the design document on the most viable and efficient approach..."
+
+"from this we have to first create create important design/architecture diagrams for this project"
+
+"yes (Can you generate the complete final README.md file integrating these diagrams and the previous design rationale?)"
+
+### 2
+
+Application: Used for bug fixing of AMQP reconnect silently stops order consuming and status recording and optimizing the code structure, use of constants.go and models.go
+
+**Tool Used:** claude-code
+
+**Prompts Used:**
+
+"Act as principal technical architect proficient in golang, distributed systems, event driven architecture and best coding practices in golang, I see that we have 2 bugs related to AMQP reconnect, basically we have to fix this by handling the ConsumeOrders and ConsumeStatus. Review the code and apply the fix for this"
+
+"Act as principal technical architect proficient in golang, distributed systems, event driven architecture and best coding practices in golang, Can we create a proper production code structure for this project like moving constants to constants.go and creating models.go for main structures. Only make changes that does not require extensive work and easy to implement without existing working flow"
