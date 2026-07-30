@@ -51,7 +51,11 @@ func (b *Broker) ConsumeOrders(ctx context.Context, prefetch int, missions chan<
 		}
 		delivery := d
 		select {
-		case missions <- ackableMission{mission: m, ack: func() { delivery.Ack(false) }}:
+		case missions <- ackableMission{
+			mission: m,
+			ack:     func() { delivery.Ack(false) },
+			nack:    func(requeue bool) { delivery.Nack(false, requeue) },
+		}:
 		case <-ctx.Done():
 		}
 	})

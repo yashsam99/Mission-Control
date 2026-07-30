@@ -47,7 +47,16 @@ func (b *Broker) dial() error {
 		return err
 	}
 	for _, q := range b.queues {
-		if _, err := ch.QueueDeclare(q, true, false, false, false, nil); err != nil {
+		dlq := q + ".dlq"
+		if _, err := ch.QueueDeclare(dlq, true, false, false, false, nil); err != nil {
+			conn.Close()
+			return err
+		}
+		args := amqp.Table{
+			"x-dead-letter-exchange":    "",
+			"x-dead-letter-routing-key": dlq,
+		}
+		if _, err := ch.QueueDeclare(q, true, false, false, false, args); err != nil {
 			conn.Close()
 			return err
 		}
@@ -165,11 +174,6 @@ func (b *Broker) runConsumer(ctx context.Context, queue string, prefetch int, ca
 	ch, err := b.channel()
 	if err != nil {
 		return nil, err
-	}
-	if prefetch > 0 {
-		if err := ch.Qos(prefetch, 0, false); err != nil {
-			return nil, err
-		}
 	}
 	deliveries, err := ch.Consume(queue, "", false, false, false, false, nil)
 	if err != nil {

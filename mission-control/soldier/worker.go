@@ -21,7 +21,6 @@ type Worker struct {
 	pub         StatusPublisher
 	sleep       func() time.Duration
 	successProb float32
-	rnd         *rand.Rand
 	log         *slog.Logger
 }
 
@@ -33,7 +32,7 @@ type Worker struct {
 // already-cancelled context without publishing anything. Using ctx here
 // would silently drop the terminal COMPLETED/FAILED status while the
 // order still gets ACKed, leaving the mission stuck IN_PROGRESS forever.
-func (w *Worker) publish(ctx context.Context, missionID, status string) {
+func (w *Worker) publish(ctx context.Context, missionID, status string) error {
 	msg := StatusMessage{
 		MissionID: missionID,
 		Status:    status,
@@ -42,23 +41,28 @@ func (w *Worker) publish(ctx context.Context, missionID, status string) {
 	}
 	pubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := w.pub.PublishStatus(pubCtx, msg, w.tokens.Get()); err != nil {
+	err := w.pub.PublishStatus(pubCtx, msg, w.tokens.Get())
+	if err != nil {
 		w.log.Error("failed to publish status", "mission_id", missionID, "status", status, "err", err)
 	}
+	return err
 }
 
 // execute runs the simulated mission and publishes IN_PROGRESS then a terminal
 // state. It intentionally does NOT abort mid-work on ctx cancellation so that a
 // graceful shutdown lets the in-flight mission finish before its order is ACKed.
-func (w *Worker) execute(ctx context.Context, m Mission) {
-	w.publish(ctx, m.ID, "IN_PROGRESS")
+func (w *Worker) execute(ctx context.Context, m Mission) error {
+	w.publish(ctx, m.ID, "IN_PROGRESS") // Best effort, don't abort if it fails
 	time.Sleep(w.sleep())
 	status := "COMPLETED"
-	if w.rnd.Float32() >= w.successProb {
+	if rand.Float32() >= w.successProb {
 		status = "FAILED"
 	}
-	w.publish(ctx, m.ID, status)
+	if err := w.publish(ctx, m.ID, status); err != nil {
+		return err // Terminal publish failed, signal to nack
+	}
 	w.log.Info("mission finished", "mission_id", m.ID, "status", status, "worker", w.id)
+	return nil
 }
 
 // missionSleep is the production sleep: 5–14s inclusive.
@@ -76,8 +80,19 @@ func runWorkerPool(ctx context.Context, size int, missions <-chan ackableMission
 		go func() {
 			defer wg.Done()
 			for am := range missions {
-				w.execute(ctx, am.mission)
-				am.ack()
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							w.log.Error("Panic in worker execution", "err", r)
+							am.nack(true) // Requeue on panic
+						}
+					}()
+					if err := w.execute(ctx, am.mission); err != nil {
+						am.nack(true) // Requeue on terminal publish failure
+					} else {
+						am.ack() // Success
+					}
+				}()
 			}
 		}()
 	}

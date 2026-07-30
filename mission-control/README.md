@@ -8,17 +8,16 @@ never expose a port — they pull work, never receive it.
 
 Three services, wired together by Docker Compose:
 
-```
-                 POST /missions                 orders_queue
-   client  ───────────────────────▶  commander  ─────────────▶  rabbitmq
-                 GET /missions/{id}       ▲                          │
-   client  ◀────────────────────────      │                          │
-                                          │      status_queue        │
-                                          └──────────────────────────┤
-                                                                     │
-                                                     orders_queue    ▼
-                                          soldier(s) ◀────────────────
-                                          (no exposed ports)
+```mermaid
+graph TD
+    Client(Client) -->|POST /missions| Commander[Commander:8080]
+    Commander -->|publish, persistent| OrdersQueue[(orders_queue)]
+    
+    Soldier[Soldier x N] -->|pull orders| OrdersQueue
+    Soldier -->|publish status + JWT| StatusQueue[(status_queue)]
+    StatusQueue -->|consume status| Commander
+    
+    Soldier -->|POST /auth| Commander
 ```
 
 - **`commander`** — the only service with an HTTP listener. Accepts new
@@ -120,7 +119,7 @@ soldiers call to bootstrap and to rotate their identity (see
 ```bash
 curl -s -X POST http://localhost:8080/auth \
   -H 'Content-Type: application/json' \
-  -d '{"bootstrap_secret":"super-secret-bootstrap"}'
+  -d '{"bootstrap_secret":"super-secret-bootstrap", "instance_id":"abc-123"}'
 ```
 
 ```json
@@ -156,14 +155,17 @@ QUEUED ──▶ IN_PROGRESS |──▶ COMPLETED
 - **`COMPLETED`** / **`FAILED`** — terminal. Set when the worker finishes; outcome is randomized (~90% success) to simulate real mission risk.
 
 ### State Transition Validation
+
 `MissionStore.UpdateStatus` enforces an explicit state transition table under a mutex lock to guarantee resilience against out-of-order, duplicate, or stale status messages:
+
 - `QUEUED` → `IN_PROGRESS`, `COMPLETED`, or `FAILED` (allows skipping `IN_PROGRESS` if network reordering drops the initial update).
 - `IN_PROGRESS` → `COMPLETED` or `FAILED`.
 - `COMPLETED` & `FAILED` are **terminal** — once reached, no subsequent status updates are accepted.
 - Out-of-order or duplicate transitions (e.g. `COMPLETED` → `IN_PROGRESS`) are rejected safely without mutating state.
 
 ### Background Goroutine Panic Safety
-Background message consumers (such as `commander`'s status consumer and `soldier`'s order workers) execute outside standard HTTP handler panic recovery middleware. To prevent an unexpected payload error or panic from taking down the entire service process, the shared `internal/broker` client executes delivery callbacks inside a `safeInvoke` wrapper that catches panics, logs stack traces via `slog`, and safely Nacks the delivery.
+
+Background message consumers (such as `commander`'s status consumer and `soldier`'s order workers) execute outside standard HTTP handler panic recovery middleware. To prevent an unexpected payload error or panic from taking down the entire service process, the shared `internal/broker` client executes delivery callbacks inside a `safeInvoke` wrapper that catches panics, logs stack traces via `slog`, and safely Nacks the delivery for requeue.
 
 ## Security & Identity Model
 
@@ -177,7 +179,9 @@ Two independent, robust security layers:
    - **Replay Window Protection:** Tokens carry a short 30-second TTL (`tokenTTL`) and are automatically rotated every 25s by the worker's background `TokenStore`. Even if a valid token is captured during transit, its utility is constrained to the remaining seconds of its 30s window and restricted to status reports originating from that verified worker instance.
 
 ### Secrets Management in Production
+
 In production, dev secrets (`BOOTSTRAP_SECRET`, `JWT_SECRET`, and `RABBITMQ_URL` credentials) must be managed outside of version control:
+
 - Inject credentials at runtime using secret managers (HashiCorp Vault, AWS Secrets Manager, Kubernetes Secrets, or Docker Secrets).
 - Environment variables should be supplied via git-ignored `.env` files (`env_file:` in Docker Compose) with distinct keys per environment.
 
@@ -187,16 +191,21 @@ To avoid code duplication between `commander` and `soldier`, all AMQP connection
 
 - **Unified Client:** `internal/broker` provides a single reconnecting broker implementation configured via callbacks, eliminating ~180 lines of duplicated reconnect logic.
 - **Concurrent Publish Locking:** AMQP frame publishing is serialized across concurrent goroutines using a dedicated publish mutex (`pubMu`), preventing channel corruption under heavy concurrent worker loads.
+- **Dead Letter Exchanges (DLX):** The broker actively configures a Dead Letter Queue (`.dlq`) routing key. Malformed or invalid messages that fail payload or JWT parsing are safely `Nack`ed (without requeue) and automatically routed to the DLQ instead of being silently dropped.
 
 ## State Persistence & Scalability Considerations
 
 ### 1. Commander State Persistence & Multi-Instance HA
+
 Currently, `MissionStore` maintains mission state in an in-memory map protected by `sync.RWMutex`.
+
 - **Process Restart:** On service restart, in-memory state is lost.
 - **Horizontal Scaling (Multi-Instance Commander):** To run multiple `commander` instances behind a load balancer, `MissionStore` would be backed by a shared persistent database (e.g. Redis for fast status updates / key-value lookups, or PostgreSQL for persistent mission audit trails). Pub/sub (or Redis keyspace notifications) would synchronize real-time status updates across Commander nodes.
 
 ### 2. Worker Fleet Bottlenecks & Scale Limits
+
 The current design scales horizontally by adding `soldier` replicas. However, at high worker counts (e.g., 500+ workers):
+
 - **Single Queue Contention:** All workers compete for deliveries on a single `orders_queue`. AMQP queue lock contention inside RabbitMQ becomes a bottleneck.
 - **QoS Prefetch Tuning:** Workers prefetch orders based on `WORKER_POOL_SIZE`. Tuning prefetch sizes prevents fast workers from starving while slow workers hold buffered messages.
 - **AMQP Socket Serialization:** A single shared AMQP connection per soldier process can bottleneck on socket I/O under extreme message throughput; multi-connection pooling is recommended for massive scale.
@@ -251,7 +260,7 @@ rotation: PASS
 ### `commander`
 
 | Variable            | Default                              | Purpose                                                              |
-|-------------------  |-------------------------------------------------------------------------------------------------------      |
+|---------------------|--------------------------------------|----------------------------------------------------------------------|
 | `HTTP_PORT`         | `8080`                               | Port the REST API listens on.                                        |
 | `RABBITMQ_URL`      | `amqp://guest:guest@localhost:5672/` | AMQP connection string (includes broker credentials).                |
 | `BOOTSTRAP_SECRET`  | `bootstrap`                          | Shared secret `POST /auth` requires to mint a JWT.                   |
@@ -260,7 +269,7 @@ rotation: PASS
 ### `soldier`
 
 | Variable              | Default                              | Purpose                                                                   |
-|---------------------- |--------------------------------------|---------------------------------------------------------------------------|
+|-----------------------|--------------------------------------|---------------------------------------------------------------------------|
 | `COMMANDER_URL`       | `http://localhost:8080`              | Base URL used to call `POST /auth` for bootstrap and rotation.            |
 | `BOOTSTRAP_SECRET`    | `bootstrap`                          | Must match `commander`'s value, or `/auth` calls are rejected.            |
 | `RABBITMQ_URL`        | `amqp://guest:guest@localhost:5672/` | AMQP connection string (includes broker credentials).                     |
@@ -271,30 +280,23 @@ apply when running a binary standalone.
 
 ## AI Usage
 
-In accordance with project guidelines, AI tooling was utilized transparently to accelerate system design and documentation formatting.
+In accordance with project guidelines, AI tooling was utilized transparently to accelerate system design, validate concurrency assumptions, and structure documentation.
 
-### 1
+### Architectural Design (Gemini)
 
-**Tool Used:** Gemini
-
-Application: Used as a Principal Architectural sounding board to compare message broker trade-offs (RabbitMQ vs. NATS), validate the thread-safe atomic.Value strategy for JWT rotation in Go, and generate the Mermaid.js architecture diagrams.
+**Application & Response Summary:** Used as a Principal Architectural sounding board to compare message broker trade-offs (RabbitMQ vs. NATS vs. Kafka), validate the thread-safe `atomic.Value` strategy for JWT rotation in Go, and generate the Mermaid.js architecture diagrams. The AI successfully proposed RabbitMQ and instance-bound JWTs as the core solutions to the zero-ingress constraint.
 
 **Prompts Used:**
 
-"Act as Principal Technical Architect with proficiency in golang, event-driven architectures, system design and distributed systems. Your task is to understand the requirements and functionality of the Project and come up with the design document on the most viable and efficient approach..."
+- *"Act as a Principal Technical Architect with proficiency in golang, event-driven architectures, system design and distributed systems. Your task is to understand the requirements and functionality of the Project and come up with the design document on the most viable and efficient approach..."*
+- *"from this we have to first create important design/architecture diagrams for this project"*
+- *"Can you generate the complete final README.md file integrating these diagrams and the previous design rationale?"*
 
-"from this we have to first create create important design/architecture diagrams for this project"
+### Bug Fixes & Refactoring (Claude Code)
 
-"yes (Can you generate the complete final README.md file integrating these diagrams and the previous design rationale?)"
-
-### 2
-
-Application: Used for bug fixing of AMQP reconnect silently stops order consuming and status recording and optimizing the code structure, use of constants.go and models.go
-
-**Tool Used:** claude-code
+**Application & Response Summary:** Used for bug fixing of AMQP reconnect silently stopping order consuming and status recording, optimizing the code structure, and resolving edge cases around graceful shutdown context cancellation. The AI correctly identified that context detach was necessary for graceful drain and provided the structural patches.
 
 **Prompts Used:**
 
-"Act as principal technical architect proficient in golang, distributed systems, event driven architecture and best coding practices in golang, I see that we have 2 bugs related to AMQP reconnect, basically we have to fix this by handling the ConsumeOrders and ConsumeStatus. Review the code and apply the fix for this"
-
-"Act as principal technical architect proficient in golang, distributed systems, event driven architecture and best coding practices in golang, Can we create a proper production code structure for this project like moving constants to constants.go and creating models.go for main structures. Only make changes that does not require extensive work and easy to implement without existing working flow"
+- *"Act as principal technical architect proficient in golang, distributed systems, event driven architecture and best coding practices in golang, I see that we have bugs related to AMQP reconnect and silent failures on graceful shutdown. Review the code and apply the fix for this"*
+- *"Act as principal technical architect... Can we create a proper production code structure for this project like moving constants to constants.go and creating models.go for main structures. Only make changes that does not require extensive work and easy to implement without existing working flow"*

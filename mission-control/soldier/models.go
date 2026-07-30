@@ -19,4 +19,5 @@ type StatusMessage struct {
 type ackableMission struct {
 	mission Mission
 	ack     func()
+	nack    func(requeue bool)
 }

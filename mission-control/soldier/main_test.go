@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
-	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -104,7 +103,6 @@ func newTestWorker(prob float32, seed int64) (*Worker, *fakeStatusPublisher) {
 		pub:         fp,
 		sleep:       func() time.Duration { return 0 },
 		successProb: prob,
-		rnd:         rand.New(rand.NewSource(seed)),
 		log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	return w, fp
@@ -187,7 +185,7 @@ func TestRunWorkerPoolExecutesAndAcks(t *testing.T) {
 		return &Worker{
 			id: id, tokens: ts, pub: fp,
 			sleep:       func() time.Duration { return 0 },
-			successProb: 1.0, rnd: rand.New(rand.NewSource(1)),
+			successProb: 1.0,
 			log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		}
 	}

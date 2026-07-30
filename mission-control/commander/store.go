@@ -73,3 +73,10 @@ func (s *MissionStore) Get(id string) (Mission, bool) {
 	mission, ok := s.missions[id]
 	return mission, ok
 }
+
+// Delete removes the mission with the given id from the store.
+func (s *MissionStore) Delete(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.missions, id)
+}

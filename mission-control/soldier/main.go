@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"log/slog"
-	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -46,16 +45,19 @@ func main() {
 	tokens.Set(firstTok)
 	log.Info("bootstrap token acquired", "instance_id", instanceID)
 
-	// Rotation goroutine.
+	// Rotation goroutine. Runs on a separate context so it outlives the main context
+	// during a graceful shutdown drain, ensuring the final COMPLETED updates don't use
+	// an expired token.
+	rotationCtx, cancelRotation := context.WithCancel(context.Background())
 	go func() {
 		ticker := time.NewTicker(rotationInterval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-rotationCtx.Done():
 				return
 			case <-ticker.C:
-				tok, err := fetchToken(ctx, httpClient, commanderURL, bootstrap, instanceID)
+				tok, err := fetchToken(rotationCtx, httpClient, commanderURL, bootstrap, instanceID)
 				if err != nil {
 					log.Warn("token rotation failed, keeping previous token", "err", err)
 					continue
@@ -77,7 +79,6 @@ func main() {
 		return &Worker{
 			id: id, tokens: tokens, pub: broker,
 			sleep: missionSleep, successProb: 0.90,
-			rnd: rand.New(rand.NewSource(time.Now().UnixNano())),
 			log: log,
 		}
 	}
@@ -95,5 +96,6 @@ func main() {
 	<-broker.OrdersDone() // wait for the consumer goroutine to actually stop before closing
 	close(missions)
 	wg.Wait()
+	cancelRotation() // now that drain is fully complete, stop rotating tokens
 	log.Info("drain complete")
 }

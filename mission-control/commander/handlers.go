@@ -54,6 +54,7 @@ func (c *Commander) handleCreateMission(w http.ResponseWriter, r *http.Request) 
 	}
 	c.store.Create(mission)
 	if err := c.publisher.PublishOrder(r.Context(), mission); err != nil {
+		c.store.Delete(mission.ID)
 		c.log.Error("failed to publish order", "mission_id", mission.ID, "err", err)
 		http.Error(w, "failed to dispatch order", http.StatusServiceUnavailable)
 		return
