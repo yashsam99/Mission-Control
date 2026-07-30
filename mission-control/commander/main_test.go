@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -50,7 +52,7 @@ func TestMissionStoreUpdateStatus(t *testing.T) {
 	mission := Mission{
 		ID:        "m2",
 		Objective: "Infiltrate the compound",
-		Status:    "PENDING",
+		Status:    "QUEUED",
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
@@ -73,9 +75,49 @@ func TestMissionStoreUpdateStatus(t *testing.T) {
 	}
 
 	// Try to update non-existent mission
-	ok = store.UpdateStatus("non-existent", "COMPLETE")
+	ok = store.UpdateStatus("non-existent", "COMPLETED")
 	if ok {
 		t.Fatal("expected UpdateStatus to fail for non-existent mission")
+	}
+}
+
+func TestMissionStoreUpdateStatusTransitions(t *testing.T) {
+	cases := []struct {
+		from string
+		to   string
+		want bool
+	}{
+		{"QUEUED", "IN_PROGRESS", true},
+		{"QUEUED", "COMPLETED", true},
+		{"QUEUED", "FAILED", true},
+		{"QUEUED", "QUEUED", false},
+		{"IN_PROGRESS", "COMPLETED", true},
+		{"IN_PROGRESS", "FAILED", true},
+		{"IN_PROGRESS", "QUEUED", false},
+		{"IN_PROGRESS", "IN_PROGRESS", false},
+		{"COMPLETED", "IN_PROGRESS", false},
+		{"COMPLETED", "COMPLETED", false},
+		{"COMPLETED", "FAILED", false},
+		{"FAILED", "COMPLETED", false},
+		{"FAILED", "IN_PROGRESS", false},
+		{"FAILED", "FAILED", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.from+"->"+tc.to, func(t *testing.T) {
+			store := NewMissionStore()
+			store.Create(Mission{ID: "m", Status: tc.from})
+			got := store.UpdateStatus("m", tc.to)
+			if got != tc.want {
+				t.Fatalf("UpdateStatus(%s -> %s) = %v, want %v", tc.from, tc.to, got, tc.want)
+			}
+			m, _ := store.Get("m")
+			if tc.want && m.Status != tc.to {
+				t.Fatalf("status = %q, want %q", m.Status, tc.to)
+			}
+			if !tc.want && m.Status != tc.from {
+				t.Fatalf("status changed to %q on rejected transition, want unchanged %q", m.Status, tc.from)
+			}
+		})
 	}
 }
 
@@ -93,7 +135,7 @@ func TestMissionStoreConcurrent(t *testing.T) {
 			mission := Mission{
 				ID:        "m" + string(rune('0'+idx/10)) + string(rune('0'+idx%10)),
 				Objective: "Mission",
-				Status:    "PENDING",
+				Status:    "QUEUED",
 				CreatedAt: time.Now(),
 				UpdatedAt: time.Now(),
 			}
@@ -122,7 +164,7 @@ func TestMissionStoreCreatedAtTimestamp(t *testing.T) {
 	mission := Mission{
 		ID:        "m_timestamp",
 		Objective: "Test timestamp",
-		Status:    "PENDING",
+		Status:    "QUEUED",
 		// CreatedAt intentionally left unset (zero value)
 		// UpdatedAt intentionally left unset (zero value)
 	}
@@ -157,20 +199,48 @@ func TestMissionStoreCreatedAtTimestamp(t *testing.T) {
 func TestSignAndValidateToken(t *testing.T) {
 	secret := []byte("test-secret-key")
 	ttl := 1 * time.Hour
+	subject := uuid.NewString()
 
-	token, err := signToken(secret, ttl)
+	token, err := signToken(secret, ttl, subject)
 	if err != nil {
 		t.Fatalf("signToken failed: %v", err)
 	}
-
 	if token == "" {
 		t.Fatal("expected non-empty token")
 	}
 
-	// Validate the token with the same secret
-	err = validateToken(secret, token)
+	claims, err := validateToken(secret, token)
 	if err != nil {
 		t.Fatalf("validateToken failed: %v", err)
+	}
+	if claims.Subject != subject {
+		t.Fatalf("claims.Subject = %q, want %q", claims.Subject, subject)
+	}
+}
+
+func TestValidateTokenMissingSubject(t *testing.T) {
+	secret := []byte("test-secret-key")
+	claims := jwt.RegisteredClaims{
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		IssuedAt:  jwt.NewNumericDate(time.Now()),
+	}
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(secret)
+	if err != nil {
+		t.Fatalf("failed to build test token: %v", err)
+	}
+	if _, err := validateToken(secret, tok); err == nil {
+		t.Fatal("expected validateToken to reject a token with no subject claim")
+	}
+}
+
+func TestValidateTokenMalformedSubject(t *testing.T) {
+	secret := []byte("test-secret-key")
+	tok, err := signToken(secret, time.Hour, "not-a-uuid")
+	if err != nil {
+		t.Fatalf("signToken failed: %v", err)
+	}
+	if _, err := validateToken(secret, tok); err == nil {
+		t.Fatal("expected validateToken to reject a non-UUID subject")
 	}
 }
 
@@ -178,14 +248,12 @@ func TestValidateTokenExpired(t *testing.T) {
 	secret := []byte("test-secret-key")
 	ttl := -1 * time.Second // already expired
 
-	token, err := signToken(secret, ttl)
+	token, err := signToken(secret, ttl, uuid.NewString())
 	if err != nil {
 		t.Fatalf("signToken failed: %v", err)
 	}
 
-	// Validate should fail because token is expired
-	err = validateToken(secret, token)
-	if err == nil {
+	if _, err := validateToken(secret, token); err == nil {
 		t.Fatal("expected validateToken to fail for expired token, but got nil")
 	}
 }
@@ -194,15 +262,13 @@ func TestValidateTokenBadSignature(t *testing.T) {
 	secret := []byte("test-secret-key")
 	ttl := 1 * time.Hour
 
-	token, err := signToken(secret, ttl)
+	token, err := signToken(secret, ttl, uuid.NewString())
 	if err != nil {
 		t.Fatalf("signToken failed: %v", err)
 	}
 
-	// Validate with wrong secret
 	wrongSecret := []byte("wrong-secret")
-	err = validateToken(wrongSecret, token)
-	if err == nil {
+	if _, err := validateToken(wrongSecret, token); err == nil {
 		t.Fatal("expected validateToken to fail with wrong secret, but got nil")
 	}
 }
@@ -261,7 +327,10 @@ func TestGetMissionNotFound(t *testing.T) {
 	srv := httptest.NewServer(c.routes())
 	defer srv.Close()
 
-	resp, _ := http.Get(srv.URL + "/missions/nope")
+	resp, err := http.Get(srv.URL + "/missions/nope")
+	if err != nil {
+		t.Fatalf("http.Get failed: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
@@ -273,8 +342,12 @@ func TestAuthValidAndInvalidSecret(t *testing.T) {
 	srv := httptest.NewServer(c.routes())
 	defer srv.Close()
 
-	ok, _ := http.Post(srv.URL+"/auth", "application/json",
-		strings.NewReader(`{"bootstrap_secret":"boot"}`))
+	instanceID := uuid.NewString()
+	ok, err := http.Post(srv.URL+"/auth", "application/json",
+		strings.NewReader(`{"bootstrap_secret":"boot","instance_id":"`+instanceID+`"}`))
+	if err != nil {
+		t.Fatalf("http.Post failed: %v", err)
+	}
 	defer ok.Body.Close()
 	if ok.StatusCode != http.StatusOK {
 		t.Fatalf("valid secret status = %d, want 200", ok.StatusCode)
@@ -283,15 +356,38 @@ func TestAuthValidAndInvalidSecret(t *testing.T) {
 		Token string `json:"token"`
 	}
 	json.NewDecoder(ok.Body).Decode(&ar)
-	if err := validateToken(c.jwtSecret, ar.Token); err != nil {
+	claims, err := validateToken(c.jwtSecret, ar.Token)
+	if err != nil {
 		t.Fatalf("issued token invalid: %v", err)
 	}
+	if claims.Subject != instanceID {
+		t.Fatalf("token subject = %q, want %q", claims.Subject, instanceID)
+	}
 
-	bad, _ := http.Post(srv.URL+"/auth", "application/json",
-		strings.NewReader(`{"bootstrap_secret":"wrong"}`))
+	bad, err := http.Post(srv.URL+"/auth", "application/json",
+		strings.NewReader(`{"bootstrap_secret":"wrong","instance_id":"`+instanceID+`"}`))
+	if err != nil {
+		t.Fatalf("http.Post failed: %v", err)
+	}
 	defer bad.Body.Close()
 	if bad.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("bad secret status = %d, want 401", bad.StatusCode)
+	}
+}
+
+func TestAuthRejectsInvalidInstanceID(t *testing.T) {
+	c, _ := newTestCommander()
+	srv := httptest.NewServer(c.routes())
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/auth", "application/json",
+		strings.NewReader(`{"bootstrap_secret":"boot","instance_id":"not-a-uuid"}`))
+	if err != nil {
+		t.Fatalf("http.Post failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
 	}
 }
 
@@ -299,7 +395,10 @@ func TestHealth(t *testing.T) {
 	c, _ := newTestCommander()
 	srv := httptest.NewServer(c.routes())
 	defer srv.Close()
-	resp, _ := http.Get(srv.URL + "/health")
+	resp, err := http.Get(srv.URL + "/health")
+	if err != nil {
+		t.Fatalf("http.Get failed: %v", err)
+	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("health status = %d, want 200", resp.StatusCode)
@@ -309,7 +408,7 @@ func TestHealth(t *testing.T) {
 func TestHandleStatusValidToken(t *testing.T) {
 	c, _ := newTestCommander()
 	c.store.Create(Mission{ID: "m1", Status: "QUEUED"})
-	tok, _ := signToken(c.jwtSecret, 30*time.Second)
+	tok, _ := signToken(c.jwtSecret, 30*time.Second, uuid.NewString())
 	body, _ := json.Marshal(StatusMessage{MissionID: "m1", Status: "COMPLETED"})
 
 	if err := c.handleStatus(amqp.Table{"authorization": tok}, body); err != nil {
@@ -324,7 +423,7 @@ func TestHandleStatusValidToken(t *testing.T) {
 func TestHandleStatusExpiredTokenIsBreach(t *testing.T) {
 	c, _ := newTestCommander()
 	c.store.Create(Mission{ID: "m1", Status: "QUEUED"})
-	tok, _ := signToken(c.jwtSecret, -1*time.Second)
+	tok, _ := signToken(c.jwtSecret, -1*time.Second, uuid.NewString())
 	body, _ := json.Marshal(StatusMessage{MissionID: "m1", Status: "COMPLETED"})
 
 	if err := c.handleStatus(amqp.Table{"authorization": tok}, body); err == nil {

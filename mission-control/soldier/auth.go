@@ -22,11 +22,14 @@ func (t *TokenStore) Get() string {
 	return s
 }
 
-// fetchToken performs POST /auth with the bootstrap secret and returns the JWT.
-func fetchToken(ctx context.Context, client *http.Client, commanderURL, bootstrap string) (string, error) {
+// fetchToken performs POST /auth with the bootstrap secret and this
+// Soldier's instance id, returning the JWT Commander issues bound (via its
+// subject claim) to instanceID.
+func fetchToken(ctx context.Context, client *http.Client, commanderURL, bootstrap, instanceID string) (string, error) {
 	payload, _ := json.Marshal(struct {
 		BootstrapSecret string `json:"bootstrap_secret"`
-	}{bootstrap})
+		InstanceID      string `json:"instance_id"`
+	}{bootstrap, instanceID})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, commanderURL+"/auth", bytes.NewReader(payload))
 	if err != nil {
 		return "", err

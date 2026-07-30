@@ -144,56 +144,62 @@ Content-Type: text/plain; charset=utf-8
 ok
 ```
 
-## Mission State Machine
+## Mission State Machine & Resilience
 
 ```
 QUEUED ──▶ IN_PROGRESS |──▶ COMPLETED
                        └──▶ FAILED
 ```
 
-- **`QUEUED`** — set by `commander` the instant `POST /missions` publishes
-  the order; before any soldier has picked it up.
-- **`IN_PROGRESS`** — set when a soldier worker dequeues the order and
-  starts executing it (published as the first status message).
-- **`COMPLETED`** / **`FAILED`** — terminal. Set when the worker finishes;
-  outcome is randomized (~90% success) to simulate real mission risk.
+- **`QUEUED`** — set by `commander` the instant `POST /missions` publishes the order; before any soldier has picked it up.
+- **`IN_PROGRESS`** — set when a soldier worker dequeues the order and starts executing it (published as the first status message).
+- **`COMPLETED`** / **`FAILED`** — terminal. Set when the worker finishes; outcome is randomized (~90% success) to simulate real mission risk.
 
-Every transition after `QUEUED` is driven by a `StatusMessage` a soldier
-publishes to `status_queue`, which `commander` consumes and applies via
-`MissionStore.UpdateStatus`.
+### State Transition Validation
+`MissionStore.UpdateStatus` enforces an explicit state transition table under a mutex lock to guarantee resilience against out-of-order, duplicate, or stale status messages:
+- `QUEUED` → `IN_PROGRESS`, `COMPLETED`, or `FAILED` (allows skipping `IN_PROGRESS` if network reordering drops the initial update).
+- `IN_PROGRESS` → `COMPLETED` or `FAILED`.
+- `COMPLETED` & `FAILED` are **terminal** — once reached, no subsequent status updates are accepted.
+- Out-of-order or duplicate transitions (e.g. `COMPLETED` → `IN_PROGRESS`) are rejected safely without mutating state.
 
-## Security Model
+### Background Goroutine Panic Safety
+Background message consumers (such as `commander`'s status consumer and `soldier`'s order workers) execute outside standard HTTP handler panic recovery middleware. To prevent an unexpected payload error or panic from taking down the entire service process, the shared `internal/broker` client executes delivery callbacks inside a `safeInvoke` wrapper that catches panics, logs stack traces via `slog`, and safely Nacks the delivery.
 
-Two independent, unrelated security layers:
+## Security & Identity Model
 
-1. **Broker authentication (AMQP).** `rabbitmq` requires the credentials
-   baked into `RABBITMQ_URL` (`RABBITMQ_DEFAULT_USER` /
-   `RABBITMQ_DEFAULT_PASS` in `docker-compose.yml`, default
-   `mission`/`control`). This is static, standard AMQP auth — it gates who
-   can connect to the broker at all, not who is allowed to report mission
-   status.
+Two independent, robust security layers:
 
-2. **Rotating JWT on status messages.** Every status message a soldier
-   publishes carries a JWT in its AMQP `authorization` header. `commander`
-   signs HS256 JWTs with `JWT_SECRET` (a secret only `commander` ever holds)
-   and validates every incoming status message against it before trusting
-   the payload; an invalid/expired/wrongly-signed token is logged as a
-   `SECURITY BREACH` and the message is nacked without requeue (dropped).
-   Tokens are minted via `POST /auth`, gated by a separate shared
-   `BOOTSTRAP_SECRET` (not the JWT secret — soldiers never see
-   `JWT_SECRET`).
+1. **Broker Authentication (AMQP):** `rabbitmq` requires credentials passed in `RABBITMQ_URL` (`mission`/`control` default). This gates physical connection to the broker.
 
-   - **TTL: 30s fixed** (`tokenTTL` in `commander/main.go`).
-   - **Rotation: every 25s** (`rotationInterval` in `soldier/main.go`) — a
-     soldier re-authenticates 5s before its current token would expire, so
-     there is no window where every held token has expired. If a rotation
-     call fails (e.g. commander briefly unreachable), the soldier logs a
-     warning and keeps using its previous (still-valid-for-a-few-more-
-     seconds) token rather than blocking.
+2. **Instance-Bound Rotating JWTs:**
+   - **Worker Instance Binding:** Each `soldier` process generates a unique instance UUID at startup. During `POST /auth`, it sends its `instance_id`. `commander` binds issued JWTs to the requesting soldier instance via a standard `sub` (subject) claim.
+   - **Verification:** `commander` validates that incoming status updates carry a valid signature, unexpired TTL, and a valid UUID `sub` claim. An invalid, expired, or malformed token triggers a security breach alert and drops the message.
+   - **Replay Window Protection:** Tokens carry a short 30-second TTL (`tokenTTL`) and are automatically rotated every 25s by the worker's background `TokenStore`. Even if a valid token is captured during transit, its utility is constrained to the remaining seconds of its 30s window and restricted to status reports originating from that verified worker instance.
 
-   This means a leaked broker credential lets an attacker connect to
-   RabbitMQ, but not forge mission status — that needs a live, signed,
-   unexpired JWT, and JWTs expire in 30 seconds.
+### Secrets Management in Production
+In production, dev secrets (`BOOTSTRAP_SECRET`, `JWT_SECRET`, and `RABBITMQ_URL` credentials) must be managed outside of version control:
+- Inject credentials at runtime using secret managers (HashiCorp Vault, AWS Secrets Manager, Kubernetes Secrets, or Docker Secrets).
+- Environment variables should be supplied via git-ignored `.env` files (`env_file:` in Docker Compose) with distinct keys per environment.
+
+## Shared Architecture & Code Organization
+
+To avoid code duplication between `commander` and `soldier`, all AMQP connection management, automatic reconnection, channel recovery, and panic-safe delivery handling are centralized in `internal/broker`.
+
+- **Unified Client:** `internal/broker` provides a single reconnecting broker implementation configured via callbacks, eliminating ~180 lines of duplicated reconnect logic.
+- **Concurrent Publish Locking:** AMQP frame publishing is serialized across concurrent goroutines using a dedicated publish mutex (`pubMu`), preventing channel corruption under heavy concurrent worker loads.
+
+## State Persistence & Scalability Considerations
+
+### 1. Commander State Persistence & Multi-Instance HA
+Currently, `MissionStore` maintains mission state in an in-memory map protected by `sync.RWMutex`.
+- **Process Restart:** On service restart, in-memory state is lost.
+- **Horizontal Scaling (Multi-Instance Commander):** To run multiple `commander` instances behind a load balancer, `MissionStore` would be backed by a shared persistent database (e.g. Redis for fast status updates / key-value lookups, or PostgreSQL for persistent mission audit trails). Pub/sub (or Redis keyspace notifications) would synchronize real-time status updates across Commander nodes.
+
+### 2. Worker Fleet Bottlenecks & Scale Limits
+The current design scales horizontally by adding `soldier` replicas. However, at high worker counts (e.g., 500+ workers):
+- **Single Queue Contention:** All workers compete for deliveries on a single `orders_queue`. AMQP queue lock contention inside RabbitMQ becomes a bottleneck.
+- **QoS Prefetch Tuning:** Workers prefetch orders based on `WORKER_POOL_SIZE`. Tuning prefetch sizes prevents fast workers from starving while slow workers hold buffered messages.
+- **AMQP Socket Serialization:** A single shared AMQP connection per soldier process can bottleneck on socket I/O under extreme message throughput; multi-connection pooling is recommended for massive scale.
 
 ## Running the Unit Tests
 
@@ -201,13 +207,12 @@ Two independent, unrelated security layers:
 go test ./... -race
 ```
 
-Verified live: 14 tests in `commander` (mission store, JWT sign/validate,
-HTTP handlers, status consumer) and 7 in `soldier` (token store, auth
-client, worker execution, worker pool) — all pass under `-race`:
+Verified live: 14 tests in `commander` (mission store, state machine transitions, JWT sub binding, HTTP handlers, status consumer) and 7 in `soldier` (token store, auth client, worker execution, worker pool), plus unit tests in `internal/broker` — all pass under `-race`:
 
 ```
-ok   mission-control/commander 2.156s
-ok   mission-control/soldier 1.649s
+ok   mission-control/commander 1.637s
+ok   mission-control/internal/broker 1.485s
+ok   mission-control/soldier 1.470s
 ```
 
 ## Running the Integration Script
@@ -263,21 +268,6 @@ rotation: PASS
 
 All four are also set explicitly in `docker-compose.yml`; the defaults above
 apply when running a binary standalone.
-
-## Known Limitations
-
-These were found and confirmed during implementation review — noted here so
-operators know what to expect, not as hypothetical risks:
-
-1. **Dev secrets are plaintext in `docker-compose.yml`.**
-   `BOOTSTRAP_SECRET`, `JWT_SECRET`, and the credentials embedded in
-   `RABBITMQ_URL` (`mission`/`control`) are committed directly in the
-   compose file. That's fine for local development and this demo, but
-   before any real deployment they should move out of version control —
-   e.g. into a git-ignored `.env` file consumed via Compose's `env_file:`
-   / variable substitution, or a proper secrets manager (Docker secrets,
-   Vault, cloud KMS, etc.) — with `RABBITMQ_URL`'s embedded username/
-   password rotated at the same time.
 
 ## AI Usage
 

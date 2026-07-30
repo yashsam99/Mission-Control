@@ -41,17 +41,22 @@ func TestFetchTokenSuccess(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			BootstrapSecret string `json:"bootstrap_secret"`
+			InstanceID      string `json:"instance_id"`
 		}
 		json.NewDecoder(r.Body).Decode(&req)
 		if req.BootstrapSecret != "boot" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
+		if req.InstanceID != "inst-1" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]any{"token": "tok-123", "expires_in": 30})
 	}))
 	defer srv.Close()
 
-	tok, err := fetchToken(context.Background(), srv.Client(), srv.URL, "boot")
+	tok, err := fetchToken(context.Background(), srv.Client(), srv.URL, "boot", "inst-1")
 	if err != nil {
 		t.Fatalf("fetchToken: %v", err)
 	}
@@ -66,7 +71,7 @@ func TestFetchTokenUnauthorized(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if _, err := fetchToken(context.Background(), srv.Client(), srv.URL, "wrong"); err == nil {
+	if _, err := fetchToken(context.Background(), srv.Client(), srv.URL, "wrong", "inst-1"); err == nil {
 		t.Fatal("expected error on 401")
 	}
 }

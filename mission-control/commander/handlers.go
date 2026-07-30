@@ -73,6 +73,7 @@ func (c *Commander) handleGetMission(w http.ResponseWriter, r *http.Request) {
 func (c *Commander) handleAuth(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		BootstrapSecret string `json:"bootstrap_secret"`
+		InstanceID      string `json:"instance_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -82,7 +83,11 @@ func (c *Commander) handleAuth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	tok, err := signToken(c.jwtSecret, tokenTTL)
+	if _, err := uuid.Parse(req.InstanceID); err != nil {
+		http.Error(w, "invalid instance_id", http.StatusBadRequest)
+		return
+	}
+	tok, err := signToken(c.jwtSecret, tokenTTL, req.InstanceID)
 	if err != nil {
 		http.Error(w, "token generation failed", http.StatusInternalServerError)
 		return
@@ -100,7 +105,8 @@ func (c *Commander) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (c *Commander) handleStatus(headers amqp.Table, body []byte) error {
 	token, _ := headers["authorization"].(string)
-	if err := validateToken(c.jwtSecret, token); err != nil {
+	claims, err := validateToken(c.jwtSecret, token)
+	if err != nil {
 		c.log.Warn("SECURITY BREACH: rejected status message", "err", err)
 		return fmt.Errorf("security breach: %w", err)
 	}
@@ -109,7 +115,8 @@ func (c *Commander) handleStatus(headers amqp.Table, body []byte) error {
 		return err
 	}
 	if !c.store.UpdateStatus(s.MissionID, s.Status) {
-		c.log.Warn("status for unknown mission", "mission_id", s.MissionID)
+		c.log.Warn("status update rejected", "mission_id", s.MissionID, "status", s.Status,
+			"instance", claims.Subject, "worker_id", s.WorkerID)
 	}
 	return nil
 }

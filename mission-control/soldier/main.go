@@ -11,6 +11,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 func getenv(key, def string) string {
@@ -32,16 +34,17 @@ func main() {
 		poolSize = 10
 	}
 	httpClient := &http.Client{Timeout: 10 * time.Second}
+	instanceID := uuid.NewString()
 
 	// Bootstrap: acquire the first token before doing anything else.
 	tokens := &TokenStore{}
-	firstTok, err := fetchToken(ctx, httpClient, commanderURL, bootstrap)
+	firstTok, err := fetchToken(ctx, httpClient, commanderURL, bootstrap, instanceID)
 	if err != nil {
 		log.Error("initial token acquisition failed", "err", err)
 		os.Exit(1)
 	}
 	tokens.Set(firstTok)
-	log.Info("bootstrap token acquired")
+	log.Info("bootstrap token acquired", "instance_id", instanceID)
 
 	// Rotation goroutine.
 	go func() {
@@ -52,7 +55,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				tok, err := fetchToken(ctx, httpClient, commanderURL, bootstrap)
+				tok, err := fetchToken(ctx, httpClient, commanderURL, bootstrap, instanceID)
 				if err != nil {
 					log.Warn("token rotation failed, keeping previous token", "err", err)
 					continue
